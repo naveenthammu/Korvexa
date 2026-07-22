@@ -42,5 +42,7 @@ def test_production_workflow_uses_protected_ssh_deployment():
     assert '"$UV" venv --clear --seed --python 3.13 .venv' in workflow
     assert ".venv/bin/python -m alembic upgrade head" in workflow
     assert "npm run build" in workflow
-    assert "sudo -n systemctl restart korvexa-api" in workflow
+    assert 'pm2 startOrReload "$APP_DIR/deploy/ecosystem.config.cjs" --update-env' in workflow
+    assert "pm2 save --force" in workflow
+    assert "systemctl restart korvexa-api" not in workflow
     assert '"$PUBLIC_URL/api/v1/ready"' in workflow

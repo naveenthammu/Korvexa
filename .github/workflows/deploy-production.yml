@@ -172,7 +172,9 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
-          sudo -n systemctl restart korvexa-api
+          command -v pm2 >/dev/null
+          pm2 startOrReload "$APP_DIR/deploy/ecosystem.config.cjs" --update-env
+          pm2 save --force
           sudo -n nginx -t
           sudo -n systemctl reload nginx
           curl --fail --silent --show-error --retry 10 --retry-delay 2 --retry-connrefused http://127.0.0.1:8000/health

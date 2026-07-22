@@ -17,7 +17,7 @@ application never creates or alters database tables during startup.
 ```text
 backend/    FastAPI application, tests, and Alembic migrations
 database/   PostgreSQL setup and reset documentation
-deploy/     systemd service for the API
+deploy/     PM2 process definition and deployment sudo policy
 frontend/   React/Vite application
 nginx/      Nginx site and logrotate configurations
 ```
@@ -28,6 +28,7 @@ nginx/      Nginx site and logrotate configurations
 - Node.js 22+ and npm
 - PostgreSQL 15+
 - Nginx for production
+- PM2 for the production API process
 
 ## Environment
 
@@ -169,17 +170,28 @@ npm ci
 npm run build
 ```
 
-### 5. Install The API Service
+### 5. Configure PM2
 
 ```bash
-sudo cp /home/pos/Korvexa/deploy/korvexa-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now korvexa-api
-sudo systemctl status korvexa-api --no-pager
+npm install --global pm2
+pm2 startOrReload /home/pos/Korvexa/deploy/ecosystem.config.cjs --update-env
+pm2 save --force
+sudo env PATH="$PATH" pm2 startup systemd -u pos --hp /home/pos
 ```
 
-The API runs as the `pos` deployment user, binds only to localhost, and
-restarts automatically after a process failure.
+Run the final command printed by `pm2 startup`, then run `pm2 save --force`
+again. The API runs as `pos`, binds only to localhost, and restarts after a
+process failure or server reboot.
+
+Configure bounded PM2 logs once:
+
+```bash
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 20M
+pm2 set pm2-logrotate:retain 14
+pm2 set pm2-logrotate:compress true
+pm2 save --force
+```
 
 ### 6. Install Nginx And Log Rotation
 
@@ -235,8 +247,8 @@ sudo install -o root -g root -m 0440 \
 sudo visudo -cf /etc/sudoers.d/korvexa-deploy
 ```
 
-The policy permits only API restart, Nginx validation, and Nginx reload. It
-does not grant arbitrary passwordless sudo access.
+The policy permits only Nginx validation and reload. PM2 runs as `pos` and does
+not need sudo. The policy does not grant arbitrary passwordless sudo access.
 
 Start automatic deployment by setting the repository Actions variable:
 
@@ -247,8 +259,9 @@ DEPLOY_ENABLED=true
 Then use **Actions > Verify and deploy production > Run workflow**, or push a
 commit to `main`. The workflow synchronizes source while preserving `.env`,
 virtual environments, dependencies, and build output; uploads the protected
-environment file; applies Alembic migrations; builds the frontend; restarts the
-API; reloads Nginx; and verifies private and public readiness endpoints.
+environment file; applies Alembic migrations; builds the frontend; reloads the
+API through PM2; reloads Nginx; and verifies private and public readiness
+endpoints.
 
 ## Updating The Server
 
@@ -270,7 +283,8 @@ cd /home/pos/Korvexa/frontend
 npm ci
 npm run build
 
-sudo systemctl restart korvexa-api
+pm2 startOrReload /home/pos/Korvexa/deploy/ecosystem.config.cjs --update-env
+pm2 save --force
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
@@ -296,7 +310,7 @@ Do not delete the current Nginx or API logs while diagnosing a deployment.
 Inspect them with:
 
 ```bash
-sudo journalctl -u korvexa-api -n 200 --no-pager
+pm2 logs korvexa-api --lines 200 --nostream
 sudo tail -n 200 /var/log/nginx/korvexa.error.log
 ```
 
@@ -306,6 +320,7 @@ sudo tail -n 200 /var/log/nginx/korvexa.error.log
 curl -fsS http://127.0.0.1:8000/health
 curl -fsS http://34.29.31.163/api/v1/ready
 curl -I http://34.29.31.163/
+pm2 status
 ```
 
 Then sign in, verify Menu is populated, place a temporary order, accept it in

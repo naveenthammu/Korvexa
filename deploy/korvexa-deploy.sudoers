@@ -1,2 +1,2 @@
 # Validate with: sudo visudo -cf /etc/sudoers.d/korvexa-deploy
-pos ALL=(root) NOPASSWD: /usr/bin/systemctl restart korvexa-api, /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx
+pos ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx
