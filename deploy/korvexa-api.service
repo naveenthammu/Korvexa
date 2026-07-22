@@ -1,0 +1,23 @@
+[Unit]
+Description=Korvexa POS API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=korvexa
+Group=korvexa
+WorkingDirectory=/opt/korvexa
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/korvexa/backend/.venv/bin/uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --workers 3 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/korvexa
+
+[Install]
+WantedBy=multi-user.target

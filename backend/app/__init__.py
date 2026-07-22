@@ -1,0 +1,1 @@
+"""Korvexa POS backend package."""

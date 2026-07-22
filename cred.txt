@@ -1,0 +1,8 @@
+cred
+service account
+----------------
+user:pos
+pass:admin123
+
+GIT tokens:
+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
