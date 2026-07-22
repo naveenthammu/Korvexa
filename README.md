@@ -89,8 +89,8 @@ Readiness: http://localhost:8000/api/v1/ready
 The checked-in production configuration targets `34.29.31.163` and uses:
 
 ```text
-Application root: /opt/korvexa
-Frontend files:   /opt/korvexa/frontend/dist
+Application root: /home/pos/Korvexa
+Frontend files:   /home/pos/Korvexa/frontend/dist
 Backend listener: 127.0.0.1:8000
 Public entrypoint: http://34.29.31.163
 ```
@@ -98,24 +98,22 @@ Public entrypoint: http://34.29.31.163
 Only ports 22, 80, and later 443 should be public. PostgreSQL and port 8000
 should remain private to the VM.
 
-### 1. Create The Service Account And Directory
+### 1. Prepare The Application Directory
 
 ```bash
-sudo adduser --system --group --home /opt/korvexa korvexa
-sudo mkdir -p /opt/korvexa
-sudo chown -R korvexa:korvexa /opt/korvexa
-sudo chmod 755 /opt/korvexa
+sudo chown -R pos:pos /home/pos/Korvexa
+sudo chmod 711 /home/pos
 ```
 
-Upload the project contents to `/opt/korvexa`. Exclude `.env`, `node_modules`,
+Upload the project contents to `/home/pos/Korvexa`. Exclude `.env`, `node_modules`,
 `.venv`, `dist`, test caches, Python caches, logs, and editor files. Create the
 production `.env` directly on the server and protect it:
 
 ```bash
-cd /opt/korvexa
-sudo -u korvexa cp .env.example .env
-sudo -u korvexa nano .env
-sudo chmod 600 .env
+cd /home/pos/Korvexa
+cp .env.example .env
+nano .env
+chmod 600 .env
 ```
 
 ### 2. Create PostgreSQL
@@ -123,7 +121,7 @@ sudo chmod 600 .env
 The setup script prompts for a database-role password and does not store it:
 
 ```bash
-sudo -u postgres psql -f /opt/korvexa/database/setup.sql
+sudo -u postgres psql -f /home/pos/Korvexa/database/setup.sql
 ```
 
 Set the same URL-encoded password in `DATABASE_URL`.
@@ -131,19 +129,22 @@ Set the same URL-encoded password in `DATABASE_URL`.
 ### 3. Install And Migrate The Backend
 
 ```bash
-cd /opt/korvexa/backend
-sudo -u korvexa python3 -m venv .venv
-sudo -u korvexa .venv/bin/python -m pip install --upgrade pip
-sudo -u korvexa .venv/bin/python -m pip install -r requirements.txt
-sudo -u korvexa .venv/bin/python -m alembic upgrade head
+curl -LsSf https://astral.sh/uv/0.11.30/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.13
+
+cd /home/pos/Korvexa/backend
+uv venv --clear --seed --python 3.13 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+.venv/bin/python -m alembic upgrade head
 ```
 
 For a new or intentionally cleared installation only, create the baseline menu,
 tables, roles, and super administrator:
 
 ```bash
-cd /opt/korvexa/backend
-sudo -u korvexa .venv/bin/python -m scripts.reset_production_data \
+cd /home/pos/Korvexa/backend
+.venv/bin/python -m scripts.reset_production_data \
   --confirm RESET-KORVEXA-PRODUCTION-DATA \
   --email admin@korvexa.com \
   --password 'REPLACE_WITH_A_STRONG_TEMPORARY_PASSWORD'
@@ -154,33 +155,39 @@ update. Change the administrator password immediately after first login.
 
 ### 4. Build The Frontend On The Server
 
-The production build reads `VITE_*` values from `/opt/korvexa/.env`:
+The production build reads `VITE_*` values from `/home/pos/Korvexa/.env`:
 
 ```bash
-cd /opt/korvexa/frontend
-sudo -u korvexa npm ci
-sudo -u korvexa npm run build
+export NVM_DIR="$HOME/.nvm"
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.6/install.sh | bash
+. "$NVM_DIR/nvm.sh"
+nvm install 22
+nvm alias default 22
+
+cd /home/pos/Korvexa/frontend
+npm ci
+npm run build
 ```
 
 ### 5. Install The API Service
 
 ```bash
-sudo cp /opt/korvexa/deploy/korvexa-api.service /etc/systemd/system/
+sudo cp /home/pos/Korvexa/deploy/korvexa-api.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now korvexa-api
 sudo systemctl status korvexa-api --no-pager
 ```
 
-The API runs as the unprivileged `korvexa` user, binds only to localhost, and
+The API runs as the `pos` deployment user, binds only to localhost, and
 restarts automatically after a process failure.
 
 ### 6. Install Nginx And Log Rotation
 
 ```bash
-sudo cp /opt/korvexa/nginx/nginx.conf /etc/nginx/sites-available/korvexa
+sudo cp /home/pos/Korvexa/nginx/nginx.conf /etc/nginx/sites-available/korvexa
 sudo ln -sfn /etc/nginx/sites-available/korvexa /etc/nginx/sites-enabled/korvexa
 sudo rm -f /etc/nginx/sites-enabled/default
-sudo cp /opt/korvexa/nginx/korvexa.logrotate /etc/logrotate.d/korvexa-nginx
+sudo cp /home/pos/Korvexa/nginx/korvexa.logrotate /etc/logrotate.d/korvexa-nginx
 sudo nginx -t
 sudo systemctl enable nginx
 sudo systemctl reload nginx
@@ -189,10 +196,64 @@ sudo systemctl reload nginx
 Nginx preserves the complete `/api/v1/...` path, serves frontend deep links
 through `index.html`, and rotates application access/error logs for 14 days.
 
+## GitHub Actions Deployment
+
+The workflow at `.github/workflows/deploy-production.yml` verifies every pull
+request and push to `main`. Production deployment runs only when the repository
+variable `DEPLOY_ENABLED` is exactly `true`. It does not use a server password.
+
+Create a GitHub Environment named `production` with these variables:
+
+```text
+SSH_HOST=34.29.31.163
+SSH_PORT=22
+SSH_USER=pos
+APP_DIR=/home/pos/Korvexa
+PUBLIC_URL=http://34.29.31.163
+```
+
+Add these encrypted environment secrets:
+
+```text
+SSH_PRIVATE_KEY       Dedicated Ed25519 private key for the pos account
+SSH_KNOWN_HOSTS       Trusted SSH host-key line for 34.29.31.163
+PRODUCTION_ENV_FILE   Complete multiline production .env content
+```
+
+Verify the server host-key fingerprint before saving `SSH_KNOWN_HOSTS`:
+
+```bash
+sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Install the limited workflow permissions once on the server:
+
+```bash
+sudo install -o root -g root -m 0440 \
+  /home/pos/Korvexa/deploy/korvexa-deploy.sudoers \
+  /etc/sudoers.d/korvexa-deploy
+sudo visudo -cf /etc/sudoers.d/korvexa-deploy
+```
+
+The policy permits only API restart, Nginx validation, and Nginx reload. It
+does not grant arbitrary passwordless sudo access.
+
+Start automatic deployment by setting the repository Actions variable:
+
+```text
+DEPLOY_ENABLED=true
+```
+
+Then use **Actions > Verify and deploy production > Run workflow**, or push a
+commit to `main`. The workflow synchronizes source while preserving `.env`,
+virtual environments, dependencies, and build output; uploads the protected
+environment file; applies Alembic migrations; builds the frontend; restarts the
+API; reloads Nginx; and verifies private and public readiness endpoints.
+
 ## Updating The Server
 
 1. Back up PostgreSQL.
-2. Upload the new source while preserving `/opt/korvexa/.env`.
+2. Upload the new source while preserving `/home/pos/Korvexa/.env`.
 3. Install changed dependencies.
 4. Build the frontend.
 5. Apply migrations before restarting the API.
@@ -201,13 +262,13 @@ through `index.html`, and rotates application access/error logs for 14 days.
 ```bash
 sudo -u postgres pg_dump -Fc korvexa > /var/backups/korvexa-$(date +%F-%H%M).dump
 
-cd /opt/korvexa/backend
-sudo -u korvexa .venv/bin/python -m pip install -r requirements.txt
-sudo -u korvexa .venv/bin/python -m alembic upgrade head
+cd /home/pos/Korvexa/backend
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m alembic upgrade head
 
-cd /opt/korvexa/frontend
-sudo -u korvexa npm ci
-sudo -u korvexa npm run build
+cd /home/pos/Korvexa/frontend
+npm ci
+npm run build
 
 sudo systemctl restart korvexa-api
 sudo nginx -t && sudo systemctl reload nginx
@@ -221,10 +282,10 @@ Generated files are excluded by `.gitignore` and should not be uploaded. After
 an update, old caches can be removed without touching source or database data:
 
 ```bash
-sudo find /opt/korvexa -type d \
+sudo find /home/pos/Korvexa -type d \
   \( -name __pycache__ -o -name .pytest_cache -o -name test-results -o -name playwright-report \) \
   -prune -exec rm -rf {} +
-sudo find /opt/korvexa -type f \
+sudo find /home/pos/Korvexa -type f \
   \( -name '*.pyc' -o -name '*.log' -o -name '*.tmp' -o -name '*.tsbuildinfo' \) \
   -delete
 sudo journalctl --vacuum-time=14d
@@ -253,12 +314,12 @@ KDS, move it through preparation to served, and remove the temporary order.
 Automated checks:
 
 ```bash
-cd /opt/korvexa/backend
-sudo -u korvexa .venv/bin/python -m pytest -q
+cd /home/pos/Korvexa/backend
+.venv/bin/python -m pytest -q
 
-cd /opt/korvexa/frontend
-sudo -u korvexa npm test -- --run
-sudo -u korvexa npx tsc --noEmit
+cd /home/pos/Korvexa/frontend
+npm test -- --run
+npx tsc --noEmit
 ```
 
 Backend tests require a separate PostgreSQL schema whose name begins with

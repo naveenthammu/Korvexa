@@ -9,7 +9,7 @@ def test_nginx_preserves_api_v1_paths_and_supports_spa_deep_links():
     config = (root / "nginx" / "nginx.conf").read_text(encoding="utf-8")
 
     assert "server_name 34.29.31.163;" in config
-    assert "root /opt/korvexa/frontend/dist;" in config
+    assert "root /home/pos/Korvexa/frontend/dist;" in config
     assert "proxy_pass http://127.0.0.1:8000;" in config
     assert "proxy_pass http://127.0.0.1:8000/;" not in config
     assert "try_files $uri $uri/ /index.html;" in config
@@ -26,3 +26,21 @@ def test_migration_graph_has_one_unambiguous_head():
 
     assert len(revision_ids) == len(set(revision_ids))
     assert script.get_heads() == ["20260722_0007"]
+
+
+def test_production_workflow_uses_protected_ssh_deployment():
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / ".github" / "workflows" / "deploy-production.yml").read_text(encoding="utf-8")
+
+    assert "environment:\n      name: production" in workflow
+    assert "vars.DEPLOY_ENABLED == 'true'" in workflow
+    assert "secrets.SSH_PRIVATE_KEY" in workflow
+    assert "secrets.SSH_KNOWN_HOSTS" in workflow
+    assert "secrets.PRODUCTION_ENV_FILE" in workflow
+    assert "ssh-keyscan" not in workflow
+    assert "--exclude='.env'" in workflow
+    assert '"$UV" venv --clear --seed --python 3.13 .venv' in workflow
+    assert ".venv/bin/python -m alembic upgrade head" in workflow
+    assert "npm run build" in workflow
+    assert "sudo -n systemctl restart korvexa-api" in workflow
+    assert '"$PUBLIC_URL/api/v1/ready"' in workflow

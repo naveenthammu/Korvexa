@@ -1,0 +1,190 @@
+name: Verify and deploy production
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: korvexa-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify application
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: korvexa_test
+          POSTGRES_USER: korvexa_test
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U korvexa_test -d korvexa_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+psycopg://korvexa_test:test-only-password@127.0.0.1:5432/korvexa_test
+      TEST_DATABASE_URL: postgresql+psycopg://korvexa_test:test-only-password@127.0.0.1:5432/korvexa_test
+      TEST_DATABASE_SCHEMA: korvexa_test
+      JWT_SECRET: test-secret-used-only-by-github-actions
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Test backend
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pytest -q
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Test frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test -- --run
+          npm exec tsc -- --noEmit
+
+  deploy:
+    name: Deploy over SSH
+    if: github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.PUBLIC_URL }}
+    env:
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_PORT: ${{ vars.SSH_PORT }}
+      SSH_USER: ${{ vars.SSH_USER }}
+      APP_DIR: ${{ vars.APP_DIR }}
+      PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      PRODUCTION_ENV_FILE: ${{ secrets.PRODUCTION_ENV_FILE }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for name in SSH_HOST SSH_PORT SSH_USER APP_DIR PUBLIC_URL SSH_PRIVATE_KEY SSH_KNOWN_HOSTS PRODUCTION_ENV_FILE; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing production environment value: $name" >&2
+              exit 1
+            fi
+          done
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_PORT" =~ ^[0-9]+$ ]]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]
+          [[ "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ && "$APP_DIR" != "/" ]]
+          [[ "$PUBLIC_URL" =~ ^https?://[^/]+/?$ ]]
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | sed 's/\r$//' > "$HOME/.ssh/korvexa_deploy"
+          chmod 600 "$HOME/.ssh/korvexa_deploy"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" | sed 's/\r$//' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Synchronize and deploy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SSH_TARGET="${SSH_USER}@${SSH_HOST}"
+          SSH_ARGS=(-i "$HOME/.ssh/korvexa_deploy" -p "$SSH_PORT" -o BatchMode=yes -o IdentitiesOnly=yes)
+
+          ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "mkdir -p '$APP_DIR'"
+          rsync -az --delete-delay \
+            -e "ssh -i $HOME/.ssh/korvexa_deploy -p $SSH_PORT -o BatchMode=yes -o IdentitiesOnly=yes" \
+            --exclude='.git/' \
+            --exclude='.env' \
+            --exclude='backend/.venv/' \
+            --exclude='frontend/node_modules/' \
+            --exclude='frontend/dist/' \
+            --exclude='**/__pycache__/' \
+            --exclude='**/.pytest_cache/' \
+            --exclude='*.pyc' \
+            --exclude='*.log' \
+            ./ "$SSH_TARGET:$APP_DIR/"
+
+          printf '%s\n' "$PRODUCTION_ENV_FILE" | ssh "${SSH_ARGS[@]}" "$SSH_TARGET" \
+            "umask 077; cat > '$APP_DIR/.env.new' && mv '$APP_DIR/.env.new' '$APP_DIR/.env' && chmod 600 '$APP_DIR/.env'"
+
+          ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "bash -se -- '$APP_DIR'" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          cd "$APP_DIR/backend"
+
+          UV="$HOME/.local/bin/uv"
+          if [[ ! -x "$UV" ]]; then
+            echo "uv is not installed at $UV" >&2
+            exit 1
+          fi
+          if [[ ! -x .venv/bin/python ]] || ! .venv/bin/python -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 13))'; then
+            "$UV" venv --clear --seed --python 3.13 .venv
+          fi
+          "$UV" pip install --python .venv/bin/python -r requirements.txt
+          .venv/bin/python -m alembic upgrade head
+
+          export NVM_DIR="$HOME/.nvm"
+          if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+            # shellcheck source=/dev/null
+            . "$NVM_DIR/nvm.sh"
+            nvm use 22 >/dev/null
+          fi
+          node -e 'const major=Number(process.versions.node.split(".")[0]); if (major < 22) { throw new Error("Node.js 22 or newer is required") }'
+
+          cd "$APP_DIR/frontend"
+          npm ci --no-audit --no-fund
+          npm run build
+
+          sudo -n systemctl restart korvexa-api
+          sudo -n nginx -t
+          sudo -n systemctl reload nginx
+          curl --fail --silent --show-error --retry 10 --retry-delay 2 --retry-connrefused http://127.0.0.1:8000/health
+          REMOTE_SCRIPT
+
+      - name: Verify public application
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused "$PUBLIC_URL/api/v1/ready"
+          curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused --head "$PUBLIC_URL/"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f "$HOME/.ssh/korvexa_deploy"
