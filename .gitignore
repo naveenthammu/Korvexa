@@ -1,4 +1,6 @@
 .env
+cred.txt
+setup for service account.txt
 .venv/
 __pycache__/
 *.pyc
